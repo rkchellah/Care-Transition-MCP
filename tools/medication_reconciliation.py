@@ -8,7 +8,7 @@ and flags discrepancies. Top cause of post-discharge harm.
 import re
 from typing import Optional
 from fhir.client import get_patient_medications, get_patient_encounters
-from llm.vertex import generate
+from llm.groq_client import generate
 from tools.patient_summary import get_patient_summary
 
 

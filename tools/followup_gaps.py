@@ -7,7 +7,7 @@ abnormal labs, and open medication follow-ups.
 
 from typing import Optional
 from fhir.client import get_patient_appointments, get_patient_observations
-from llm.vertex import generate
+from llm.groq_client import generate
 from tools.patient_summary import get_patient_summary
 
 

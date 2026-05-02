@@ -114,7 +114,7 @@ Three bugs that weren't obvious and took real time to solve.
 care-transition-mcp/
 ├── main.py                          # MCP server, SHARP extension, middleware
 ├── fhir/client.py                   # FHIR API calls using Po headers
-├── llm/vertex.py                    # Groq client
+├── llm/groq_client.py               # Groq client
 ├── tools/
 │   ├── patient_summary.py
 │   ├── transition_brief.py

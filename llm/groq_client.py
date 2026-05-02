@@ -1,14 +1,11 @@
 """
 Groq Client
 -----------
-Uses Groq API for fast, free LLM inference.
-Replaced Google AI Studio due to billing requirements.
-
-Set GROQ_API_KEY in Cloud Run environment variables.
+Uses Groq API for fast, free LLM inference (LLaMA 3.3 70B).
+Set GROQ_API_KEY in environment variables or .env file.
 """
 
 import os
-import asyncio
 from groq import AsyncGroq
 from dotenv import load_dotenv
 

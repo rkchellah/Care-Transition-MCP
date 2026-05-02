@@ -2,12 +2,12 @@
 Tool: generate_transition_brief
 --------------------------------
 The core tool. Pulls patient FHIR context from Po and uses
-Gemini to generate a structured handoff document.
+Groq (LLaMA 3.3 70B) to generate a structured handoff document.
 """
 
 from typing import Optional
 from fhir.client import get_patient_encounters, get_patient_observations
-from llm.vertex import generate
+from llm.groq_client import generate
 from tools.patient_summary import get_patient_summary
 
 

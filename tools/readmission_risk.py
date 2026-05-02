@@ -8,7 +8,7 @@ is clearest — no rule-based system synthesizes this.
 
 from typing import Optional
 from fhir.client import get_patient_encounters, get_patient_observations
-from llm.vertex import generate
+from llm.groq_client import generate
 from tools.patient_summary import get_patient_summary
 
 
