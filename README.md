@@ -1,5 +1,6 @@
 ![Architecture](./care_transition_mcp_architecture.svg)
 
+---
 # Care Transition MCP
 
 **Five FHIR-grounded tools for safer patient handoffs — built for the Prompt Opinion platform**
