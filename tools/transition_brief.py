@@ -5,12 +5,19 @@ The core tool. Pulls patient FHIR context from Po and uses
 Groq (LLaMA 3.3 70B) to generate a structured handoff document.
 
 Fix (May 2026):
-    Conditions are now split into clinical vs social before hitting the LLM.
+    Conditions are split into clinical vs social before hitting the LLM.
     This prevents the SDoH Trap — where social history (employment, education)
     gets weighted the same as active medical problems in the output.
 
     Vitals are fetched separately from labs so the LLM can speak to
-    the patient's current physiological state, not just historical data.
+    the patient's current physiological state.
+
+    Medication zero-warning added for ICU transitions — no medications
+    on an ICU patient is a safety flag, not a clean bill of health.
+
+    Nursing Care Plan section added — mirrors real clinical handover
+    structure where the receiving team gets immediate action items,
+    not just a data summary.
 """
 
 from typing import Optional
@@ -63,6 +70,12 @@ def _split_conditions(raw_conditions: list) -> tuple[list, list]:
     return clinical, social
 
 
+def _is_icu_transition(transition_type: str) -> bool:
+    """Return True if this is an ICU-level transition."""
+    icu_keywords = ["icu", "intensive", "critical"]
+    return any(k in transition_type.lower() for k in icu_keywords)
+
+
 async def generate_transition_brief(
     fhir_url: str,
     patient_id: str,
@@ -79,7 +92,7 @@ async def generate_transition_brief(
 
     # Most recent vitals — clinician needs current physiological state
     vitals_text = ""
-    for obs in vitals[:3]:
+    for obs in vitals[:5]:
         name = obs.get("code", {}).get("text", "Vital")
         value = obs.get("valueQuantity", {})
         val_str = f"{value.get('value', '?')} {value.get('unit', '')}".strip()
@@ -102,33 +115,42 @@ async def generate_transition_brief(
         lab_text += f"- {name}: {val_str} ({date}){flag}\n"
 
     # Pull primary admission reason from the most recent encounter
-    primary_reason = "Not recorded"
+    primary_reason = "Not recorded — clinician must verify primary admission diagnosis before accepting transfer"
     encounter_history = ""
     for enc in encounters:
         reason = enc.get("reasonCode", [{}])[0].get("text", "")
         enc_type = enc.get("type", [{}])[0].get("text", "Visit")
         enc_date = enc.get("period", {}).get("start", "Unknown date")
-        if reason and primary_reason == "Not recorded":
+        if reason and primary_reason.startswith("Not recorded"):
             primary_reason = reason
         encounter_history += f"- {enc_type} on {enc_date}: {reason or 'No reason recorded'}\n"
 
-    # Explicit warning when no medications are on record
-    # "None recorded" is ambiguous — could mean no meds or a data gap
+    # Medication safety language — zero medications on an ICU patient is a red flag
     if summary["current_medications"]:
         medications_text = "\n".join(
             f"- {m['medication']}: {m['dosage']}"
             for m in summary["current_medications"]
         )
+        medication_warning = ""
     else:
-        medications_text = (
-            "No active medications on record. "
-            "Verify with clinical team: this may reflect a data gap, "
-            "not the patient's actual medication status."
-        )
+        medications_text = "No active medications found in FHIR records."
+        if _is_icu_transition(transition_type):
+            medication_warning = (
+                "SAFETY FLAG: It is highly irregular for an ICU patient to have zero medications "
+                "on record. The receiving team must verify what was administered in the ICU — "
+                "IV fluids, antibiotics, vasopressors, sedation — and confirm what requires "
+                "continuation, titration, or discontinuation on the ward. Do not assume this "
+                "patient is medication-free."
+            )
+        else:
+            medication_warning = (
+                "NOTE: No medications on record. Confirm with the clinical team whether this "
+                "reflects a genuine clinical status or a gap in FHIR documentation."
+            )
 
     prompt = f"""
-You are a clinical nurse writing a handover brief for the receiving care team.
-Write in the order a clinician actually needs the information.
+You are a senior clinical nurse writing a formal handover brief for the receiving care team.
+Write like a clinician handing over to the next shift — direct, prioritised, action-oriented.
 Use only the data provided. Do not add clinical details not in the data.
 
 PATIENT: {summary['name']} | DOB: {summary['birth_date']}
@@ -136,39 +158,58 @@ TRANSITION: {transition_type}
 
 ---
 
-Write the handover in this exact order and use these section headings:
+Write the handover using these exact section headings, in this exact order:
 
-1. REASON FOR ADMISSION
-State why this patient was admitted. Use this: {primary_reason}
+1. PRIMARY CLINICAL IMPRESSION AND REASON FOR TRANSFER
+State the admission reason. If not recorded, say so explicitly and flag that the receiving
+clinician must verify before accepting the transfer.
+Admission reason: {primary_reason}
 
-2. CURRENT CLINICAL STATUS
-Summarise the patient's physiological stability based on the vitals below.
-If vitals are missing, write: "Recent vitals not available — verify before transfer."
+2. RECENT PHYSIOLOGICAL STATUS
+Summarise the patient's current physical state from the vitals below.
+List each vital with its value and date.
+If any standard vital is missing (Pulse, BP, RR, SpO2, Temp), name it explicitly as missing
+and instruct the receiving nurse to obtain it immediately on arrival.
 
 RECENT VITALS:
-{vitals_text or "No recent vitals recorded"}
+{vitals_text or "No recent vitals recorded — full set required before transfer."}
 
 3. ACTIVE MEDICAL PROBLEMS
-List clinical diagnoses only. Do not include social history here.
-{chr(10).join(f"- {c}" for c in clinical_conditions) or "None recorded"}
+Clinical diagnoses only. Do not list social history here.
+If no acute medical conditions are flagged, state that clearly.
+{chr(10).join(f"- {c}" for c in clinical_conditions) or "No acute medical conditions currently flagged in the problem list."}
 
-4. MEDICATIONS AT DISCHARGE
+4. MEDICATION RECONCILIATION
 {medications_text}
 
+{medication_warning}
+
 5. RECENT LABS AND PENDING RESULTS
-{lab_text or "No recent labs recorded"}
+{lab_text or "No recent lab results recorded."}
 
-6. FOLLOW-UP REQUIRED
-{encounter_history or "No recent encounters recorded"}
+6. PSYCHOSOCIAL CONTEXT AND DISCHARGE BARRIERS
+This section covers social history only — relevant to discharge planning and safety,
+not immediate medical stability.
+Write a brief assessment of how these factors affect the transition, not just a list.
+{chr(10).join(f"- {s}" for s in social_conditions) or "No social history recorded."}
 
-7. PSYCHOSOCIAL CONTEXT AND DISCHARGE BARRIERS
-Social history relevant to discharge planning only.
-This is background context — not an active medical problem.
-{chr(10).join(f"- {s}" for s in social_conditions) or "No social history recorded"}
+7. NURSING CARE PLAN — IMMEDIATE ACTION ITEMS
+Based on the sections above, list 2-4 concrete actions for the receiving nurse,
+in priority order. Format each as:
+ACTION: [what to do and why]
+
+These should address the most critical gaps identified — missing vitals, medication
+verification, social safety concerns, and any follow-up that must happen before this
+patient can be safely discharged from the ward.
+
+RECENT ENCOUNTER HISTORY (for context):
+{encounter_history or "No recent encounters recorded."}
 
 ---
 
-Keep the total brief under 450 words. Be direct. Write like a nurse handing over to the next shift.
+Keep the total brief under 500 words.
+Write like a nurse, not a report generator.
+Lead with what the next clinician needs to act on, not what looks complete on paper.
 """
 
     brief_text = await generate(prompt, temperature=0.1)
