@@ -18,6 +18,9 @@ Fix (May 2026):
     Nursing Care Plan section added — mirrors real clinical handover
     structure where the receiving team gets immediate action items,
     not just a data summary.
+
+    Section 3 hardened — social conditions explicitly blocked from
+    appearing in Active Medical Problems regardless of LLM reasoning.
 """
 
 from typing import Optional
@@ -115,7 +118,10 @@ async def generate_transition_brief(
         lab_text += f"- {name}: {val_str} ({date}){flag}\n"
 
     # Pull primary admission reason from the most recent encounter
-    primary_reason = "Not recorded — clinician must verify primary admission diagnosis before accepting transfer"
+    primary_reason = (
+        "Not recorded — clinician must verify primary admission diagnosis "
+        "before accepting transfer"
+    )
     encounter_history = ""
     for enc in encounters:
         reason = enc.get("reasonCode", [{}])[0].get("text", "")
@@ -123,9 +129,12 @@ async def generate_transition_brief(
         enc_date = enc.get("period", {}).get("start", "Unknown date")
         if reason and primary_reason.startswith("Not recorded"):
             primary_reason = reason
-        encounter_history += f"- {enc_type} on {enc_date}: {reason or 'No reason recorded'}\n"
+        encounter_history += (
+            f"- {enc_type} on {enc_date}: {reason or 'No reason recorded'}\n"
+        )
 
-    # Medication safety language — zero medications on an ICU patient is a red flag
+    # Medication safety language
+    # Zero medications on an ICU patient is a red flag, not a clean record
     if summary["current_medications"]:
         medications_text = "\n".join(
             f"- {m['medication']}: {m['dosage']}"
@@ -136,16 +145,16 @@ async def generate_transition_brief(
         medications_text = "No active medications found in FHIR records."
         if _is_icu_transition(transition_type):
             medication_warning = (
-                "SAFETY FLAG: It is highly irregular for an ICU patient to have zero medications "
-                "on record. The receiving team must verify what was administered in the ICU — "
-                "IV fluids, antibiotics, vasopressors, sedation — and confirm what requires "
-                "continuation, titration, or discontinuation on the ward. Do not assume this "
-                "patient is medication-free."
+                "SAFETY FLAG: It is highly irregular for an ICU patient to have zero "
+                "medications on record. The receiving team must verify what was administered "
+                "in the ICU — IV fluids, antibiotics, vasopressors, sedation — and confirm "
+                "what requires continuation, titration, or discontinuation on the ward. "
+                "Do not assume this patient is medication-free."
             )
         else:
             medication_warning = (
-                "NOTE: No medications on record. Confirm with the clinical team whether this "
-                "reflects a genuine clinical status or a gap in FHIR documentation."
+                "NOTE: No medications on record. Confirm with the clinical team whether "
+                "this reflects a genuine clinical status or a gap in FHIR documentation."
             )
 
     prompt = f"""
@@ -168,16 +177,21 @@ Admission reason: {primary_reason}
 2. RECENT PHYSIOLOGICAL STATUS
 Summarise the patient's current physical state from the vitals below.
 List each vital with its value and date.
-If any standard vital is missing (Pulse, BP, RR, SpO2, Temp), name it explicitly as missing
-and instruct the receiving nurse to obtain it immediately on arrival.
+If any standard vital is missing (Pulse, BP, RR, SpO2, Temp), name it explicitly as
+missing and instruct the receiving nurse to obtain it immediately on arrival.
 
 RECENT VITALS:
 {vitals_text or "No recent vitals recorded — full set required before transfer."}
 
 3. ACTIVE MEDICAL PROBLEMS
-Clinical diagnoses only. Do not list social history here.
-If no acute medical conditions are flagged, state that clearly.
-{chr(10).join(f"- {c}" for c in clinical_conditions) or "No acute medical conditions currently flagged in the problem list."}
+List clinical diagnoses only — conditions such as infections, chronic disease,
+organ failure, or physical injury found in the medical problem list.
+If the clinical problem list is empty, write exactly this one line:
+"No acute clinical conditions flagged in FHIR records."
+Do not mention social history, employment, education, abuse history, social contact,
+or any psychosocial finding in this section under any circumstances.
+Those belong in section 6 only. This section is for medical diagnoses only.
+{chr(10).join(f"- {c}" for c in clinical_conditions) or "No acute clinical conditions flagged in FHIR records."}
 
 4. MEDICATION RECONCILIATION
 {medications_text}
@@ -189,20 +203,19 @@ If no acute medical conditions are flagged, state that clearly.
 
 6. PSYCHOSOCIAL CONTEXT AND DISCHARGE BARRIERS
 This section covers social history only — relevant to discharge planning and safety,
-not immediate medical stability.
+not immediate medical stability for the ward transfer.
 Write a brief assessment of how these factors affect the transition, not just a list.
 {chr(10).join(f"- {s}" for s in social_conditions) or "No social history recorded."}
 
 7. NURSING CARE PLAN — IMMEDIATE ACTION ITEMS
-Based on the sections above, list 2-4 concrete actions for the receiving nurse,
+Based on the gaps identified above, list 2-4 concrete actions for the receiving nurse
 in priority order. Format each as:
 ACTION: [what to do and why]
 
-These should address the most critical gaps identified — missing vitals, medication
-verification, social safety concerns, and any follow-up that must happen before this
-patient can be safely discharged from the ward.
+Address the most critical gaps first — missing vitals, medication verification,
+social safety concerns, and follow-up that must happen before ward discharge.
 
-RECENT ENCOUNTER HISTORY (for context):
+RECENT ENCOUNTER HISTORY (context only, do not repeat in sections above):
 {encounter_history or "No recent encounters recorded."}
 
 ---
