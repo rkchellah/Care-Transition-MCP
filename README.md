@@ -1,158 +1,128 @@
-# Anzen 安全
-
-> The production demo has an Auth0 callback issue post-hackathon. Full breakdown of what worked, what broke, and why: [Medium Post](https://medium.com/@chellakamina/anzen-what-i-built-what-broke-and-what-i-learned-about-ai-agents-and-credentials-5dee0ff88d30)
+![Architecture](./care_transition_mcp_architecture.svg)
 
 ---
+# Care Transition MCP
 
-**An AI agent that acts on your behalf — without ever touching your credentials.**
+**Five FHIR-grounded tools for safer patient handoffs — built for the Prompt Opinion platform**
 
-Every AI agent that connects to your tools has the same problem: it needs your OAuth tokens to do anything. Most solutions store them in a database, an env file, or a session. That means your GitHub token, your Gmail access, your Slack credentials — all sitting somewhere in an app you're trusting not to leak them.
+Hospital readmissions cost the US healthcare system $26 billion a year. The most common cause isn't clinical — it's a bad handoff. A nurse scrambles to write a discharge summary from scattered records, misses a pending lab result, forgets a follow-up appointment. The patient goes home without the right information, and comes back three weeks later.
 
-Anzen doesn't hold any of it. You connect GitHub, Gmail, and Slack through Auth0 Token Vault. The tokens live there, sealed. When the agent needs to make an API call, it requests a short-lived access token, uses it immediately, and discards it. Anzen never sees the underlying credential. Not in memory, not in logs, not ever.
-
----
-
-## Live Demo
-🔗 [anzen-o2vn.vercel.app](https://anzen-o2vn.vercel.app/)
+This MCP server addresses that directly. Select a patient in Po, ask for a transition brief, and get a structured clinical document in seconds — pulled from real FHIR data, synthesized by AI.
 
 ---
 
 ## What it does
 
 ```
-"Summarize my open GitHub issues and check if I have any unread emails about them."
+"Generate a care transition brief for this patient being discharged home."
 ```
 
-The agent has nine tools across three providers:
+The agent calls five tools in sequence:
 
-1. **list_github_issues** — fetches open issues from your connected repos
-2. **close_github_issue** — closes an issue by number
-3. **comment_on_issue** — posts a comment to a GitHub issue
-4. **list_unread_emails** — fetches unread Gmail messages
-5. **send_email** — sends an email from your account
-6. **list_slack_channels** — lists channels in your connected Slack workspace
-7. **post_slack_message** — posts a message to a specified channel
+1. **get_patient_summary** — pulls name, DOB, active conditions, medications from FHIR
+2. **generate_transition_brief** — builds a 6-section handoff document
+3. **flag_followup_gaps** — flags missing appointments, abnormal labs, medication follow-ups
+4. **medication_reconciliation** — checks for duplicates, missing meds, dosage concerns
+5. **readmission_risk_narrative** — generates a LOW/MODERATE/HIGH risk assessment with recommended actions
 
-Each tool requests a fresh token from Token Vault for its provider, makes the API call, and returns the result. No token survives past the request.
-
----
-
-## How Token Vault works
-
-1. You log in with Google via Auth0
-2. You connect GitHub, Gmail, and Slack — tokens stored in Auth0 Token Vault, not in Anzen
-3. When the agent calls a tool, it runs `getTokenForProvider(provider)`, which exchanges your Auth0 session for a live third-party access token
-4. The token is used once and discarded
-5. Anzen never stores any credential at any layer
-
----
-
-## Security model
-
-Every agent action sits in one of three tiers:
-
-- 🟢 **Watch** — read only, granted once at setup
-- 🟡 **Act** — requires session confirmation
-- 🔴 **Sensitive** — requires fresh re-auth every time
+Each tool works independently. Any agent on the Po platform can use any one of them.
 
 ---
 
 ## Running locally
 
 ```bash
-git clone https://github.com/rkchellah/Anzen
-cd Anzen
-npm install
-cp .env.example .env.local
-# Fill in .env.local (see below)
-npm run dev
-# Open http://localhost:3000
+git clone https://github.com/YOUR_USERNAME/care-transition-mcp
+cd care-transition-mcp
+
+pip install -r requirements.txt
+
+cp .env.example .env
+# Add GROQ_API_KEY to .env (free at console.groq.com)
+
+python main.py
+# Server starts at http://localhost:8080/sse
 ```
 
 ---
 
-## Environment variables
+## Deploying to Cloud Run
 
 ```bash
-AUTH0_SECRET=
-AUTH0_DOMAIN=
-AUTH0_CLIENT_ID=
-AUTH0_CLIENT_SECRET=
-AUTH0_AUDIENCE=https://anzen.api
-AUTH0_TOKEN_VAULT_URL=
-APP_BASE_URL=http://localhost:3000
-GROQ_API_KEY=
-NEXT_PUBLIC_APP_URL=http://localhost:3000
+gcloud run deploy care-transition-mcp \
+  --source . \
+  --project YOUR_PROJECT_ID \
+  --region us-central1 \
+  --allow-unauthenticated \
+  --port 8080
+
+gcloud run services update care-transition-mcp \
+  --set-env-vars GROQ_API_KEY=your_key_here
 ```
 
-You'll need an Auth0 account with Token Vault enabled and a Groq API key (free at console.groq.com). GitHub, Gmail, and Slack OAuth apps must be configured as Social Connections in your Auth0 dashboard.
+---
+
+## Registering in Po
+
+1. Configuration → MCP Servers → Add MCP Server
+2. Endpoint: `https://YOUR_CLOUD_RUN_URL/sse`, Transport: SSE, Auth: None
+3. Click Continue — Po will detect the SHARP FHIR extension
+4. Toggle on the extension, authorize the FHIR scopes, save
+
+---
+
+## How FHIR context works
+
+When a patient is selected in Po, three HTTP headers are injected into every tool call:
+
+```
+X-FHIR-Server-URL:    https://app.promptopinion.ai/api/workspaces/{id}/fhir
+X-FHIR-Access-Token:  <bearer token>
+X-Patient-ID:         <fhir patient id>
+```
+
+The server declares support for this via the SHARP extension in the MCP `initialize` response. Tools read the headers from a Python `ContextVar` set by a raw ASGI middleware — see the bug log below for why this approach was necessary.
 
 ---
 
 ## Stack
 
-- **Frontend**: Next.js 16 + TypeScript
-- **Agent**: Vercel AI SDK + Groq (LLaMA 3.3 70B)
-- **Auth + credentials**: Auth0 v4 (nextjs-auth0) + Token Vault
-- **APIs**: Octokit (GitHub), googleapis (Gmail), @slack/web-api (Slack)
-- **Hosting**: Vercel
+- **MCP framework**: FastMCP 1.9.0
+- **Transport**: SSE (Server-Sent Events)
+- **FHIR**: httpx calling Po's FHIR R4 API
+- **LLM**: Groq API — LLaMA 3.3 70B
+- **Hosting**: Google Cloud Run
+- **Data**: Po synthetic EHR bundle (no real PHI)
+
+---
+
+## What I learned building this
+
+Three bugs that weren't obvious and took real time to solve.
+
+**`BaseHTTPMiddleware` crashes SSE.** I used Starlette's convenience middleware to capture FHIR headers. It crashed immediately with `AssertionError: Unexpected message: http.response.start`. The reason: `BaseHTTPMiddleware` buffers the HTTP response body before passing it downstream. SSE responses don't have a body — they stream indefinitely. Fixed it with a raw ASGI middleware class that passes `scope`, `receive`, `send` directly without touching the response.
+
+**FHIR headers don't reach tool functions via `ctx.request_context.request`.** In SSE transport, that object is the GET `/sse` connection — established once. Tool calls come as POST requests to `/messages/` later, as a different request. I switched to a `ContextVar` set by the middleware on every incoming HTTP request. ContextVars propagate through async call chains, so the value set during the POST is visible inside the tool that runs within that same context.
+
+**Po reads `capabilities.extensions`, not `capabilities.experimental`.** The SHARP spec and Po's own docs describe slightly different fields. FastMCP's `ServerCapabilities` Pydantic model doesn't have `extensions` in its schema, but uses `model_config = ConfigDict(extra="allow")`. Fixed it with injecting via `__pydantic_extra__` and verifying with `model_dump()` before deploying.
 
 ---
 
 ## Project structure
 
 ```
-Anzen/
-├── app/
-│   ├── api/
-│   │   ├── chat/route.ts         — AI agent chat endpoint (Groq + tools)
-│   │   ├── status/route.ts       — Connection status checker
-│   │   └── auth/disconnect/      — Provider disconnect endpoint
-│   ├── dashboard/
-│   │   ├── page.tsx              — Dashboard server component
-│   │   └── DashboardClient.tsx   — Full dashboard UI (chat, connections, audit log)
-│   ├── layout.tsx
-│   ├── page.tsx                  — Landing / login page
-│   └── globals.css
-├── agent/
-│   └── tools/
-│       ├── github.ts
-│       ├── gmail.ts
-│       └── slack.ts
-├── lib/
-│   └── auth0.ts                  — Auth0 client + Token Vault token fetcher
-├── proxy.ts                      — Auth0 middleware (Next.js 16)
-├── RULES.md
-├── CHECKLIST.md
-└── .env.example
+care-transition-mcp/
+├── main.py                          # MCP server, SHARP extension, middleware
+├── fhir/client.py                   # FHIR API calls using Po headers
+├── llm/groq_client.py               # Groq client
+├── tools/
+│   ├── patient_summary.py
+│   ├── transition_brief.py
+│   ├── followup_gaps.py
+│   ├── medication_reconciliation.py
+│   └── readmission_risk.py
+├── Dockerfile
+└── requirements.txt
 ```
 
 ---
-
-## What I learned building this
-
-Four bugs that weren't obvious and took real time to solve.
-
-**Auth0 v4 is a complete rewrite, not an upgrade.** I started with v3 patterns — `handleAuth`, `UserProvider`, `AUTH0_ISSUER_BASE_URL`, callback at `/api/auth/callback`. None of it exists in v4. The library now uses `Auth0Provider`, env variables renamed, callback moved to `/auth/callback`, and Next.js 16's `proxy.ts` replaces `middleware.ts`. The error message (`Cannot read properties of undefined (reading 'middleware')`) points at the wrong thing entirely. You have to know the API changed wholesale to find the right fix.
-
-**Two middleware files will silently break Auth0's state parameter.** Next.js 16 expects `proxy.ts` at the project root. I had a leftover `middleware.ts` from earlier work sitting alongside it. Auth0's login flow generates a `state` parameter during the redirect — with both files present, the request routing broke in a way that ate the state before the callback could read it. The error was `The state parameter is missing`. The fix was deleting `middleware.ts`. Only `proxy.ts` should exist.
-
-**AI SDK v6 changed how messages are stored and how you send them.** Two separate bugs, both invisible unless you know what changed. First: `append({ role, content })` no longer exists — v6 uses `sendMessage({ text })`. Second: message content is no longer in `message.content` as a string — it's in `message.parts` as an array. So even after fixing the send, messages weren't rendering because I was reading a field that doesn't exist anymore. Both required reading the v6 source to understand what actually changed.
-
-**I committed `.env.local` to git.** Not a subtle bug. It happened fast — ran `git add .` before confirming `.gitignore` was in place, pushed, and all credentials were in the public history. Immediate fix: `git rm --cached .env.local`, rotate every key. The prevention is boring but the only thing that works: `git status` before every commit, not after.
-
----
-
-## Auth0 Token Vault — full configuration checklist
-
-Token Vault requires more dashboard setup than the Auth0 docs suggest up front. If something isn't working, check these:
-
-- Disable Refresh Token Rotation in your app's settings
-- Enable the Token Vault grant type under Advanced Settings
-- Create a Custom API with identifier `https://anzen.api`
-- Create a Custom API Client for machine-to-machine token exchanges
-- Authorize your app on the My Account API with Connected Accounts scopes
-- Enable Allow Skipping User Consent on the My Account API
-- Enable Multi-Resource Refresh Token on the My Account API
-- Authorize your app on the Management API with `update:users` scope (required for disconnect)
-- Authorize your app on the Anzen API under Application Access for both User and Client access
