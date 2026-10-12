@@ -1,13 +1,18 @@
 """
 Care Transition MCP Server
 --------------------------
-Exposes 5 tools for safe patient care transitions using Po FHIR data and Gemini AI.
+Exposes 5 tools for safe patient care transitions using Po FHIR data and Groq (LLaMA 3.3 70B).
 
 FHIR Context:
-    Po sends FHIR headers on every POST to /messages/ (the tool call endpoint).
-    We capture them in middleware using Python contextvars so they're accessible
-    during tool execution without relying on ctx.request_context.request
-    (which captures the GET /sse connection, not the POST tool call).
+    The middleware below copies the FHIR headers into a contextvar on every
+    HTTP request. With SSE in mcp 1.9.0, a POST to /messages/ only queues the
+    tool call; the tool runs in a task spawned from the long-lived GET /sse
+    connection, so it reads the headers set when that connection was opened.
+
+    This works today because Po sends the headers on the initial GET /sse.
+    Known limitation: if the user switches patient (or the token changes)
+    without reconnecting, tools could use the previous patient's ID and token.
+    Fixing it needs an mcp upgrade (POST request visible to tools) - deferred.
 
     Headers captured:
     - X-FHIR-Server-URL
@@ -15,6 +20,7 @@ FHIR Context:
     - X-Patient-ID
 """
 
+import os
 import uvicorn
 from contextvars import ContextVar
 
@@ -29,10 +35,13 @@ from tools.readmission_risk import readmission_risk_narrative
 # Defaults to empty dict so tools never crash on missing headers
 _fhir_ctx: ContextVar[dict] = ContextVar("fhir_ctx", default={})
 
+# Cloud Run sets PORT; default to 8080 locally
+PORT = int(os.getenv("PORT", "8080"))
+
 mcp = FastMCP(
     "care-transition-mcp",
     host="0.0.0.0",
-    port=8080,
+    port=PORT,
 )
 
 # --- SHARP / Po FHIR Extension declaration ---
@@ -67,6 +76,9 @@ class FhirHeaderMiddleware:
     """
     Raw ASGI middleware that captures FHIR context headers from every
     incoming HTTP request and stores them in a contextvar.
+
+    Tools see the value set on the GET /sse connection, not on the POST
+    that carries the tool call (see module docstring).
 
     Must be raw ASGI (not BaseHTTPMiddleware) because BaseHTTPMiddleware
     is incompatible with SSE streaming responses — it buffers the body
@@ -118,7 +130,7 @@ async def get_patient_summary_tool(ctx: Context) -> dict:
 async def generate_transition_brief_tool(transition_type: str, ctx: Context) -> dict:
     """
     Generate a structured care transition brief for a patient being discharged.
-    Uses FHIR data and Gemini AI to produce a clinician-ready handoff document.
+    Uses FHIR data and Groq (LLaMA 3.3 70B) to produce a clinician-ready handoff document.
 
     Args:
         transition_type: Type of transition — hospital-to-home, ICU-to-ward,
@@ -173,4 +185,4 @@ async def readmission_risk_narrative_tool(ctx: Context) -> dict:
 if __name__ == "__main__":
     app = mcp.sse_app()
     app.add_middleware(FhirHeaderMiddleware)
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

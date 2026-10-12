@@ -25,12 +25,13 @@ Fix (May 2026):
 
 from typing import Optional
 from fhir.client import (
+    DataUnavailable,
     get_patient_conditions,
     get_patient_encounters,
     get_patient_observations,
 )
 from llm.groq_client import generate
-from tools.patient_summary import get_patient_summary
+from tools.patient_summary import ACCESS_DENIED_RULE, get_patient_summary, unavailable_notes
 
 
 def _split_conditions(raw_conditions: list) -> tuple[list, list]:
@@ -91,11 +92,24 @@ async def generate_transition_brief(
     vitals = await get_patient_observations(fhir_url, patient_id, fhir_token, category="vital-signs")
     labs = await get_patient_observations(fhir_url, patient_id, fhir_token, category="laboratory")
 
-    clinical_conditions, social_conditions = _split_conditions(raw_conditions)
+    notes = unavailable_notes(summary, raw_conditions, encounters, vitals, labs)
+
+    if isinstance(raw_conditions, DataUnavailable):
+        clinical_text = social_text = str(raw_conditions)
+    else:
+        clinical_conditions, social_conditions = _split_conditions(raw_conditions)
+        clinical_text = (
+            "\n".join(f"- {c}" for c in clinical_conditions)
+            or "No acute clinical conditions flagged in FHIR records."
+        )
+        social_text = (
+            "\n".join(f"- {s}" for s in social_conditions)
+            or "No social history recorded."
+        )
 
     # Most recent vitals — clinician needs current physiological state
-    vitals_text = ""
-    for obs in vitals[:5]:
+    vitals_text = str(vitals) if isinstance(vitals, DataUnavailable) else ""
+    for obs in ([] if isinstance(vitals, DataUnavailable) else vitals[:5]):
         name = obs.get("code", {}).get("text", "Vital")
         value = obs.get("valueQuantity", {})
         val_str = f"{value.get('value', '?')} {value.get('unit', '')}".strip()
@@ -103,8 +117,8 @@ async def generate_transition_brief(
         vitals_text += f"- {name}: {val_str} ({date})\n"
 
     # Most recent 5 labs
-    lab_text = ""
-    for obs in labs[:5]:
+    lab_text = str(labs) if isinstance(labs, DataUnavailable) else ""
+    for obs in ([] if isinstance(labs, DataUnavailable) else labs[:5]):
         name = obs.get("code", {}).get("text", "Lab")
         value = obs.get("valueQuantity", {})
         val_str = f"{value.get('value', '?')} {value.get('unit', '')}".strip()
@@ -123,7 +137,9 @@ async def generate_transition_brief(
         "before accepting transfer"
     )
     encounter_history = ""
-    for enc in encounters:
+    if isinstance(encounters, DataUnavailable):
+        primary_reason = encounter_history = str(encounters)
+    for enc in ([] if isinstance(encounters, DataUnavailable) else encounters):
         reason = enc.get("reasonCode", [{}])[0].get("text", "")
         enc_type = enc.get("type", [{}])[0].get("text", "Visit")
         enc_date = enc.get("period", {}).get("start", "Unknown date")
@@ -135,7 +151,14 @@ async def generate_transition_brief(
 
     # Medication safety language
     # Zero medications on an ICU patient is a red flag, not a clean record
-    if summary["current_medications"]:
+    if summary["current_medications"] is None:
+        medications_text = summary["data_unavailable"]["current_medications"]
+        medication_warning = (
+            "SAFETY FLAG: The medication list could not be read. Do not assume this "
+            "patient is medication-free; obtain the current medication list from the "
+            "sending team before transfer."
+        )
+    elif summary["current_medications"]:
         medications_text = "\n".join(
             f"- {m['medication']}: {m['dosage']}"
             for m in summary["current_medications"]
@@ -160,7 +183,7 @@ async def generate_transition_brief(
     prompt = f"""
 You are a senior clinical nurse writing a formal handover brief for the receiving care team.
 Write like a clinician handing over to the next shift — direct, prioritised, action-oriented.
-Use only the data provided. Do not add clinical details not in the data.
+Use only the data provided. Do not add clinical details not in the data.{ACCESS_DENIED_RULE.rstrip() if notes else ""}
 
 PATIENT: {summary['name']} | DOB: {summary['birth_date']}
 TRANSITION: {transition_type}
@@ -191,7 +214,7 @@ If the clinical problem list is empty, write exactly this one line:
 Do not mention social history, employment, education, abuse history, social contact,
 or any psychosocial finding in this section under any circumstances.
 Those belong in section 6 only. This section is for medical diagnoses only.
-{chr(10).join(f"- {c}" for c in clinical_conditions) or "No acute clinical conditions flagged in FHIR records."}
+{clinical_text}
 
 4. MEDICATION RECONCILIATION
 {medications_text}
@@ -205,7 +228,7 @@ Those belong in section 6 only. This section is for medical diagnoses only.
 This section covers social history only — relevant to discharge planning and safety,
 not immediate medical stability for the ward transfer.
 Write a brief assessment of how these factors affect the transition, not just a list.
-{chr(10).join(f"- {s}" for s in social_conditions) or "No social history recorded."}
+{social_text}
 
 7. NURSING CARE PLAN — IMMEDIATE ACTION ITEMS
 Based on the gaps identified above, list 2-4 concrete actions for the receiving nurse
@@ -227,9 +250,19 @@ Lead with what the next clinician needs to act on, not what looks complete on pa
 
     brief_text = await generate(prompt, temperature=0.1)
 
+    # Don't rely on the LLM to keep the warning: put it at the top of the brief
+    if notes:
+        brief_text = (
+            "DATA UNAVAILABLE:\n"
+            + "\n".join(f"- {n}" for n in notes)
+            + "\n\n"
+            + brief_text
+        )
+
     return {
         "patient_id": patient_id,
         "patient_name": summary["name"],
         "transition_type": transition_type,
         "brief": brief_text,
+        "data_unavailable": notes,
     }

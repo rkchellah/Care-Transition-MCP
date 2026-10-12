@@ -20,12 +20,13 @@ Fix (May 2026):
 
 from typing import Optional
 from fhir.client import (
+    DataUnavailable,
     get_patient_conditions,
     get_patient_encounters,
     get_patient_observations,
 )
 from llm.groq_client import generate
-from tools.patient_summary import get_patient_summary
+from tools.patient_summary import ACCESS_DENIED_RULE, get_patient_summary, unavailable_notes
 from tools.transition_brief import _split_conditions
 
 
@@ -39,11 +40,31 @@ async def readmission_risk_narrative(
     encounters = await get_patient_encounters(fhir_url, patient_id, fhir_token, limit=5)
     observations = await get_patient_observations(fhir_url, patient_id, fhir_token)
 
-    clinical_conditions, social_conditions = _split_conditions(raw_conditions)
-    encounter_count = len(encounters)
+    notes = unavailable_notes(summary, raw_conditions, encounters, observations)
+
+    if isinstance(raw_conditions, DataUnavailable):
+        clinical_text = social_text = str(raw_conditions)
+    else:
+        clinical_conditions, social_conditions = _split_conditions(raw_conditions)
+        clinical_text = "\n".join(f"- {c}" for c in clinical_conditions) or "None recorded"
+        social_text = "\n".join(f"- {s}" for s in social_conditions) or "None recorded"
+
+    if isinstance(encounters, DataUnavailable):
+        encounter_count = None
+        encounters_text = str(encounters)
+    else:
+        encounter_count = len(encounters)
+        encounters_text = f"{encounter_count} in the last 5 on record"
+
+    medications = summary["current_medications"]
+    medications_text = (
+        summary["data_unavailable"]["current_medications"]
+        if medications is None
+        else f"{len(medications)} on record"
+    )
 
     lab_summary = []
-    for obs in observations[:8]:
+    for obs in ([] if isinstance(observations, DataUnavailable) else observations[:8]):
         name = obs.get("code", {}).get("text", "")
         value = obs.get("valueQuantity", {})
         val_str = f"{value.get('value', '?')} {value.get('unit', '')}".strip()
@@ -56,22 +77,27 @@ async def readmission_risk_narrative(
         if name:
             lab_summary.append(f"- {name}: {val_str}{flag}")
 
+    if isinstance(observations, DataUnavailable):
+        lab_text = str(observations)
+    else:
+        lab_text = "\n".join(lab_summary) or "No lab data available"
+
     prompt = f"""
 You are a clinical risk analyst writing a readmission risk assessment.
-Use only the data provided. Do not invent clinical details.
+Use only the data provided. Do not invent clinical details.{ACCESS_DENIED_RULE.rstrip() if notes else ""}
 
 PATIENT: {summary['name']} | DOB: {summary['birth_date']}
-RECENT ENCOUNTERS: {encounter_count} in the last 5 on record
-ACTIVE MEDICATIONS: {len(summary['current_medications'])} on record
+RECENT ENCOUNTERS: {encounters_text}
+ACTIVE MEDICATIONS: {medications_text}
 
 CLINICAL CONDITIONS — these determine the risk level:
-{chr(10).join(f"- {c}" for c in clinical_conditions) or "None recorded"}
+{clinical_text}
 
 RECENT LAB VALUES:
-{chr(10).join(lab_summary) or "No lab data available"}
+{lab_text}
 
 PSYCHOSOCIAL AND SOCIAL HISTORY — contextual barriers only, not primary risk drivers:
-{chr(10).join(f"- {s}" for s in social_conditions) or "None recorded"}
+{social_text}
 
 Respond in exactly this format:
 
@@ -104,4 +130,5 @@ RECOMMENDED ACTIONS:
         "risk_level": risk_level,
         "narrative": narrative_text,
         "encounter_count_last5": encounter_count,
+        "data_unavailable": notes,
     }
