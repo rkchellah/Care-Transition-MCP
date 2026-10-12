@@ -6,3 +6,9 @@ __pycache__/
 .venv/
 dist/
 build/
+
+# Architecture diagram now lives in README.md as Mermaid
+care_transition_mcp_architecture.svg
+
+# fhir/, llm/, tools/ are namespace packages; keep them without __init__.py
+__init__.py

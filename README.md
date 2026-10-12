@@ -1,4 +1,33 @@
-![Architecture](./care_transition_mcp_architecture.svg)
+```mermaid
+flowchart TD
+    clinician["Clinician<br/>selects patient, types prompt"]
+
+    subgraph po["Prompt Opinion platform"]
+        agent["BYO Agent<br/>GPT-4.1-mini"]
+        sharp["SHARP context<br/>injects FHIR headers"]
+        store[("Po FHIR store<br/>synthetic patient data")]
+    end
+
+    subgraph server["Care Transition MCP server — Cloud Run"]
+        summary["patient summary<br/><i>FHIR only</i>"]
+        brief["transition brief<br/><i>FHIR + AI</i>"]
+        gaps["followup gaps<br/><i>FHIR + AI</i>"]
+        medrec["medication recon<br/><i>FHIR + AI</i>"]
+        risk["risk narrative<br/><i>FHIR + AI</i>"]
+    end
+
+    fhirapi["Po FHIR API<br/>Patient, Condition, Medication..."]
+    groq["Groq API<br/>LLaMA 3.3 70B — free tier"]
+    output["Clinical output<br/>discharge brief · gap flags · med recon · risk narrative"]
+
+    clinician --> agent
+    agent --> sharp
+    sharp -- "SSE + FHIR headers" --> server
+    server --> fhirapi
+    fhirapi --- store
+    brief & gaps & medrec & risk --> groq
+    server --> output
+```
 
 ---
 # Care Transition MCP
